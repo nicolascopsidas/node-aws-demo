@@ -1,0 +1,240 @@
+service: ecommerce-microservices
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  environment:
+    PRODUCT_TABLE: ${self:service}-products-${self:provider.stage}
+    ORDER_TABLE: ${self:service}-orders-${self:provider.stage}
+    ORDER_EVENTS_BUS: ${self:service}-order-events-${self:provider.stage}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource:
+            - !GetAtt ProductsTable.Arn
+            - !GetAtt OrdersTable.Arn
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            - !GetAtt OrderEventBus.Arn
+        - Effect: Allow
+          Action:
+            - states:StartExecution
+          Resource:
+            - !Ref OrderProcessingStateMachine
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource:
+            - !GetAtt NotificationQueue.Arn
+
+plugins:
+  - serverless-plugin-typescript
+  - serverless-dynamodb-local
+  - serverless-offline
+
+package:
+  individually: true
+
+custom:
+  cors:
+    origin: '*'
+    headers:
+      - Content-Type
+      - X-Amz-Date
+      - Authorization
+      - X-Api-Key
+      - X-Amz-Security-Token
+      - X-Amz-User-Agent
+    allowCredentials: false
+  dynamodb:
+    stages:
+      - dev
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+  serverless-offline:
+    useChildProcesses: true
+    noAuth: true
+
+functions:
+  # Product Service
+  getProducts:
+    handler: services/product-service/handlers/getProducts.handler
+    events:
+      - http:
+          path: products
+          method: get
+          cors: ${self:custom.cors}
+
+  getProductById:
+    handler: services/product-service/handlers/getProductById.handler
+    events:
+      - http:
+          path: products/{id}
+          method: get
+          cors: ${self:custom.cors}
+
+  createProduct:
+    handler: services/product-service/handlers/createProduct.handler
+    events:
+      - http:
+          path: products
+          method: post
+          cors: ${self:custom.cors}
+
+  # Order Service
+  createOrder:
+    handler: services/order-service/handlers/createOrder.handler
+    events:
+      - http:
+          path: orders
+          method: post
+          cors: ${self:custom.cors}
+
+  getOrders:
+    handler: services/order-service/handlers/getOrders.handler
+    events:
+      - http:
+          path: orders
+          method: get
+          cors: ${self:custom.cors}
+
+  getOrderById:
+    handler: services/order-service/handlers/getOrderById.handler
+    events:
+      - http:
+          path: orders/{id}
+          method: get
+          cors: ${self:custom.cors}
+
+  # Order Processing
+  processOrder:
+    handler: services/order-service/handlers/processOrder.handler
+    events:
+      - eventBridge:
+          eventBus: !Ref OrderEventBus
+          pattern:
+            source:
+              - order-service
+            detail-type:
+              - OrderCreated
+
+  # Notification Service
+  sendOrderConfirmation:
+    handler: services/notification-service/handlers/sendOrderConfirmation.handler
+    events:
+      - sqs:
+          arn: !GetAtt NotificationQueue.Arn
+          batchSize: 1
+
+resources:
+  Resources:
+    # DynamoDB Tables
+    ProductsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.PRODUCT_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ORDER_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+
+    # EventBridge
+    OrderEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:provider.environment.ORDER_EVENTS_BUS}
+
+    # SQS Queue
+    NotificationQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-notification-queue-${self:provider.stage}
+
+    # Step Function
+    OrderProcessingStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:service}-order-processing-${self:provider.stage}
+        DefinitionString: |
+          {
+            "Comment": "Order Processing Workflow",
+            "StartAt": "ValidateOrder",
+            "States": {
+              "ValidateOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:${self:provider.region}:*:function:${self:service}-${self:provider.stage}-processOrder",
+                "Next": "SendNotification"
+              },
+              "SendNotification": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage",
+                "Parameters": {
+                  "QueueUrl": { "Ref": "NotificationQueue" },
+                  "MessageBody": {
+                    "orderId.$": "$.orderId",
+                    "status.$": "$.status",
+                    "customerEmail.$": "$.customerEmail"
+                  }
+                },
+                "End": true
+              }
+            }
+          }
+        RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+    StepFunctionsExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: states.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: StepFunctionsExecutionPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - "arn:aws:lambda:${self:provider.region}:*:function:${self:service}-${self:provider.stage}-processOrder"
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource:
+                    - !GetAtt NotificationQueue.Arn
